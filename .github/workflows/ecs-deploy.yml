@@ -1,0 +1,219 @@
+name: Deploy ECS
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: "project name"
+        required: true
+        type: string
+      env:
+        description: "environment"
+        required: true
+        default: prod
+        type: string
+      run-task:
+        description: "true: run task, false: don't run task"
+        required: false
+        default: false
+        type: boolean
+      deploy:
+        description: "true: deploy, false: don't deploy"
+        required: false
+        default: false
+        type: boolean
+      batch-deploy:
+        required: false
+        default: false
+        type: boolean
+      command:
+        description: "command used for step: Run ECS Task"
+        required: false
+        default: echo test
+        type: string
+      github-sha:
+        description: "github-sha"
+        required: false
+        default: ${{ github.sha }}
+        type: string
+      airbrake-project-id-rails:
+        description: "airbrake project id rails"
+        required: false
+        type: string
+      airbrake-project-id-js:
+        description: "airbrake project id js"
+        required: false
+        type: string
+    secrets:
+      AWS_ROLE_TO_ASSUME:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: false
+      AIRBRAKE_PROJECT_KEY_RAILS:
+        required: false
+      AIRBRAKE_PROJECT_KEY_JS:
+        required: false
+
+jobs:
+  ecs-deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLUSTER_NAME: ${{ inputs.env }}-${{ inputs.project }}
+      SERVICE_WEB_NAME: ${{ inputs.env }}-${{ inputs.project }}-web
+      SERVICE_SIDEKIQ_NAME: ${{ inputs.env }}-${{ inputs.project }}-sidekiq
+      TASK_DEFINITION_WEB_NAME: ${{ inputs.env }}-${{ inputs.project }}-web
+      TASK_DEFINITION_RUN_NAME: ${{ inputs.env }}-${{ inputs.project }}-run
+      TASK_DEFINITION_SIDEKIQ_NAME: ${{ inputs.env }}-${{ inputs.project }}-sidekiq
+      IMAGE_REPO_NAME_NGINX: ${{ inputs.project }}/nginx
+      IMAGE_REPO_NAME_RAILS: ${{ inputs.project }}/rails
+      ECR_REPO_URL: *********.dkr.ecr.ap-northeast-1.amazonaws.com
+      ECR_ID: *********
+      CONTAINER_NAME_NGINX: nginx
+      CONTAINER_NAME_RAILS: rails
+      CONTAINER_NAME_SIDEKIQ: sidekiq
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v3
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          aws-region: ap-northeast-1
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+
+      - name: Check Image is Built
+        run: |
+          aws ecr list-images --registry-id ${{ env.ECR_ID }} --repository-name $IMAGE_REPO_NAME_NGINX |grep ${{ inputs.github-sha }} && \
+          aws ecr list-images --registry-id ${{ env.ECR_ID }} --repository-name $IMAGE_REPO_NAME_RAILS |grep ${{ inputs.github-sha }}
+      - name: Image is not ready
+        if: ${{ failure() }}
+        run: |
+          echo "Image is not found in repositories"
+
+      - name: Render Amazon ECS task definition for task runner container
+        if: ${{ inputs.run-task == true || inputs.batch-deploy == true }}
+        id: render-task-runner-container
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ./.github/task_definitions/${{ env.TASK_DEFINITION_RUN_NAME }}.json
+          container-name: ${{ env.CONTAINER_NAME_RAILS }}
+          image: ${{ env.ECR_REPO_URL }}/${{ env.IMAGE_REPO_NAME_RAILS }}:${{ inputs.github-sha }}
+          environment-variables: |
+            LOG_LEVEL=info
+
+      - name: Render Amazon ECS task definition for nginx container
+        if: ${{ inputs.deploy == true }}
+        id: render-nginx-container
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ./.github/task_definitions/${{ env.TASK_DEFINITION_WEB_NAME }}.json
+          container-name: ${{ env.CONTAINER_NAME_NGINX }}
+          image: ${{ env.ECR_REPO_URL }}/${{ env.IMAGE_REPO_NAME_NGINX }}:${{ inputs.github-sha }}
+          environment-variables: |
+            LOG_LEVEL=info
+
+      - name: Render Amazon ECS task definition for rails container
+        if: ${{ inputs.deploy == true }}
+        id: render-rails-container
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-nginx-container.outputs.task-definition }}
+          container-name: ${{ env.CONTAINER_NAME_RAILS }}
+          image: ${{ env.ECR_REPO_URL }}/${{ env.IMAGE_REPO_NAME_RAILS }}:${{ inputs.github-sha }}
+          environment-variables: |
+            LOG_LEVEL=info
+
+      - name: Render Amazon ECS task definition for sidekiq container
+        if: ${{ inputs.deploy == true }}
+        id: render-sidekiq-container
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ./.github/task_definitions/${{ env.TASK_DEFINITION_SIDEKIQ_NAME }}.json
+          container-name: ${{ env.CONTAINER_NAME_SIDEKIQ }}
+          image: ${{ env.ECR_REPO_URL }}/${{ env.IMAGE_REPO_NAME_RAILS }}:${{ inputs.github-sha }}
+          environment-variables: |
+            LOG_LEVEL=info
+
+      - name: Environment
+        run: |
+          if [[ ${{ inputs.env }} == "prod" ]]; then
+            echo "ENVIRONMENT=production" >> $GITHUB_ENV
+          elif [[ ${{ inputs.env }} == "stg" ]]; then
+            echo  "ENVIRONMENT=staging" >> $GITHUB_ENV
+          fi
+        shell: bash
+
+      - name: Deploy to Amazon ECS task runner
+        if: ${{ inputs.run-task == true || inputs.batch-deploy == true }}
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          cluster: ${{ env.CLUSTER_NAME }}
+          task-definition: ${{ steps.render-task-runner-container.outputs.task-definition }}
+
+      - name: Execute Command
+        if: ${{ inputs.run-task == true }}
+        run: |
+          ./run_task.sh "${environment^^}" "$name" "$command"
+        shell: bash
+        working-directory: scripts/batch
+        env:
+          environment: ${{ env.ENVIRONMENT }}
+          name: GitHubActions-${{ github.run_id }}-${{ github.run_attempt }}
+          command: ${{ inputs.command }}
+
+      - name: Deploy to Amazon ECS service web
+        id: deploy-ecs-service-web
+        if: ${{ inputs.deploy == true }}
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          cluster: ${{ env.CLUSTER_NAME }}
+          service: ${{ env.SERVICE_WEB_NAME }}
+          task-definition: ${{ steps.render-rails-container.outputs.task-definition }}
+          wait-for-service-stability: true
+          codedeploy-appspec: appspec.yml
+          codedeploy-application: ${{ inputs.env }}-fargate-${{ inputs.project }}
+          codedeploy-deployment-group: ${{ inputs.env }}-fargate-${{ inputs.project }}-app
+
+      - name: Deploy to Amazon ECS service sidekiq
+        id: deploy-sidekiq-ecs-service
+        if: ${{ inputs.deploy == true }}
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          cluster: ${{ env.CLUSTER_NAME }}
+          service: ${{ env.SERVICE_SIDEKIQ_NAME }}
+          task-definition: ${{ steps.render-sidekiq-container.outputs.task-definition }}
+          wait-for-service-stability: true
+
+      - name: Airbrake Deploy Rails
+        if: ${{ inputs.deploy == true }}
+        uses: mtchavez/airbrake-deploy-github-action@v1
+        with:
+          project-id: ${{ inputs.airbrake-project-id-rails }}
+          project-key: ${{ secrets.AIRBRAKE_PROJECT_KEY_RAILS }}
+          environment: ${{ env.ENVIRONMENT }}
+          repository: https://github.com${{ github.repo }}
+          revision: ${{ github.sha }}
+          user: ${{ github.actor }}
+
+      - name: Airbrake Deploy JS
+        if: ${{ inputs.deploy == true }}
+        uses: mtchavez/airbrake-deploy-github-action@v1
+        with:
+          project-id: ${{ inputs.airbrake-project-id-js }}
+          project-key: ${{ secrets.AIRBRAKE_PROJECT_KEY_JS }}
+          environment: ${{ env.ENVIRONMENT }}
+          repository: https://github.com${{ github.repo }}
+          revision: ${{ github.sha }}
+          user: ${{ github.actor }}
+
+      - name: Notify
+        if: ${{ inputs.deploy == true && always() }}
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,commit,action,took,ref,author,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

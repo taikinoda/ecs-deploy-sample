@@ -1,0 +1,25 @@
+name: prod ECS DEPLOY
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pre-workflow:
+    uses: ./.github/workflows/check-branch.yml
+
+  call-ecs-deploy-workflow:
+    uses: ./.github/workflows/ecs-deploy.yml
+    needs: pre-workflow
+    with:
+      project: ****
+      env: prod
+      run-task: true
+      deploy: true
+      command: bundle exec rails db:apply
+      airbrake-project-id-rails: *****
+      airbrake-project-id-js: *****
+    secrets:
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME_PROD }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_PROD }}
+      AIRBRAKE_PROJECT_KEY_RAILS: ${{ secrets.AIRBRAKE_PROJECT_KEY_RAILS_PROD }}
+      AIRBRAKE_PROJECT_KEY_JS: ${{ secrets.AIRBRAKE_PROJECT_KEY_JS_PROD }}

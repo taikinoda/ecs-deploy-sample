@@ -1,0 +1,17 @@
+name: Check Branch
+
+on:
+  workflow_call:
+
+jobs:
+  pre-workflow:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if the branch is master
+        id: check-branch
+        run: |
+          if [[ ${{ github.ref_name }} == "master" ]];then
+            echo "Success"
+          else
+            echo "this branch is not master" && exit 1
+          fi
